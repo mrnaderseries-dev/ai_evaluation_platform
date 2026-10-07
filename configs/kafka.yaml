@@ -1,0 +1,52 @@
+# Kafka configuration for the ingestion layer.
+#
+# Loaded by ai_eval_platform.infrastructure.kafka.config.load_settings().
+# Environment variables (KAFKA_*) always override these values, so a
+# deployment can change settings without editing files.
+#
+# Rationale for the offset-lifecycle settings is in
+# src/ai_eval_platform/infrastructure/kafka/config.py and Kafka_analysis.md.
+
+bootstrap_servers: "localhost:9092"
+
+# Consumer group for the main ingestion loop.
+group_id: "ai-eval-platform-ingestion"
+
+# Topics.
+input_topic: "ai.events"
+dlq_topic: "ai.events.dlq"
+retry_topic: "ai.events.retry"
+
+# MUST be false. Offsets are committed explicitly by the consumer, and only
+# after the record's durable destination (DB, retry topic, or DLQ) is
+# confirmed by the broker. Auto-commit would acknowledge records whose write
+# has not completed - the premature-commit data-loss window.
+enable_auto_commit: false
+
+# Where to start when the group has no committed offset. "earliest" replays
+# history, which is the safe default for an evaluation platform that must not
+# silently drop events.
+auto_offset_reset: "earliest"
+
+# Rebalance safety. The consumer never sleeps on retry backoff: retries are
+# deferred through the retry topic, so the loop keeps polling. This budget
+# therefore only has to cover one record's validate + DB + publish time.
+#
+# These are NOT a substitute for bounding processing time. If DB or broker
+# latency can exceed this budget, reduce max_poll_records rather than
+# raising this number (see "Remaining Risks" in Kafka_analysis.md).
+max_poll_interval_ms: 300000
+session_timeout_ms: 45000
+heartbeat_interval_ms: 3000
+
+# Records handed over per poll. Bounds how long the consumer can hold the
+# partition between polls, and therefore bounds memory per batch.
+max_poll_records: 100
+
+# Broker record-size ceiling. The validator's accepted-input limit is derived
+# from this so that a DLQ envelope always fits (base64 inflates by 4/3).
+message_max_bytes: 1000000
+
+# How long a single publish may block waiting for broker acknowledgement
+# before it is treated as failed (and the source offset left uncommitted).
+produce_timeout_s: 30.0

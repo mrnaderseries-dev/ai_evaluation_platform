@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-eval-platform"
+version = "0.1.0"
+description = "Agent-agnostic AI evaluation and observability platform"
+readme = "README.md"
+requires-python = ">=3.11"
+# Only dependencies that are imported by, or directly required to run, the code
+# that currently exists in this repository. See the dependency audit notes in
+# README.md before adding anything else.
+dependencies = [
+    # pydantic -> schemas/events/* (event envelopes)
+    "pydantic>=2.0",
+    # SQLAlchemy -> src/ai_eval_platform/storage/* (models, repositories)
+    "SQLAlchemy>=2.0",
+    # PostgreSQL is the production target of the storage layer
+    # (src/ai_eval_platform/storage/postgres.py); a DBAPI driver is required
+    # for it to connect.
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+# Required to run the test suite. Keep this list in sync with what the tests
+# actually import (currently: pytest only).
+dev = [
+    "pytest>=8.0",
+]
+# Kafka transport. Optional because the application layer
+# (src/ai_eval_platform/ingestion) depends only on the ConfirmedProducer /
+# RecordSource protocols and must remain importable and testable WITHOUT a
+# broker. Only src/ai_eval_platform/infrastructure/kafka imports the client,
+# and it raises a clear install hint if the package is missing.
+kafka = [
+    "confluent-kafka>=2.3",
+    # Only needed to read configs/kafka.yaml; environment variables work
+    # without it.
+    "PyYAML>=6.0",
+]
+
+[tool.setuptools]
+# Explicit src-layout mapping. Every subpackage of ai_eval_platform ships an
+# __init__.py, so package discovery is a plain (non-namespace) find.
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["ai_eval_platform*"]
+namespaces = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# "." exposes the repository-level `schemas` package (intentionally not
+# installed; the top-level name is too generic to put in site-packages).
+# "src" keeps the suite runnable even without an editable install.
+pythonpath = [".", "src"]

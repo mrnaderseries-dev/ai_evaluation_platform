@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+
+.venv/
+venv/
+pycache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.pyc
+src/ai_eval_platform.egg-info/
+
+out.txt
+pytest_out.txt
+storage_dump.txt
