@@ -14,7 +14,7 @@ from ai_eval_platform.storage.models import (
     Lineage,
 )
 
-# Every table registered by the updated models (30 total).
+# Every table registered by the updated models (31 total).
 EXPECTED_TABLES = {
     "agents",
     "agent_versions",
@@ -23,6 +23,7 @@ EXPECTED_TABLES = {
     "policy_versions",
     "agent_policies",
     "events",
+    "persisted_signals",
     "agent_behavior_events",
     "context_events",
     "context_resources",

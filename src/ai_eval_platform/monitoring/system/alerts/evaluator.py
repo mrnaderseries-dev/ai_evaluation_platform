@@ -9,7 +9,6 @@ from ..status.models import (
 )
 from .models import (
     Alert,
-    AlertSeverity,
     AlertStatus,
 )
 from .rules import MetricThresholdRule
@@ -54,9 +53,7 @@ class AlertEvaluator:
                     Alert(
                         alert_id=str(uuid4()),
                         component=metric.component,
-                        severity=AlertSeverity(
-                            rule.severity
-                        ),
+                        severity=rule.severity,
                         status=AlertStatus.FIRING,
                         condition=(
                             f"{metric.metric_name} "

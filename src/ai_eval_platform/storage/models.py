@@ -90,6 +90,9 @@ class Run(Base, TimestampMixin):
     final_answer: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    monitoring_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    monitoring_claim_id: Mapped[str | None] = mapped_column(String(64))
+    monitoring_claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     error_type: Mapped[str | None] = mapped_column(String(255))
     error_message: Mapped[str | None] = mapped_column(Text)
@@ -184,6 +187,34 @@ class Event(Base):
     policy_decisions: Mapped[list[PolicyDecision]] = relationship(back_populates="event")
 
 
+class EventObservation(Base):
+    """Versioned normalized projection of a source event, never an anomaly finding."""
+    __tablename__ = "event_observations"
+    __table_args__ = (
+        UniqueConstraint("source_event_id", "projection_version", name="uq_observation_source_projection"),
+        Index("ix_observations_agent_time", "agent_id", "observed_at"),
+        Index("ix_observations_run_sequence", "run_id", "sequence_number"),
+        Index("ix_observations_type_time", "event_type", "occurred_at"),
+    )
+
+    observation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    source_event_id: Mapped[str] = mapped_column(ForeignKey("events.event_id", ondelete="CASCADE"), nullable=False, index=True)
+    projection_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.agent_id", ondelete="RESTRICT"), nullable=False, index=True)
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(150), nullable=False)
+    system_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    system_version: Mapped[str | None] = mapped_column(String(100))
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    observed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    sequence_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    parent_event_id: Mapped[str | None] = mapped_column(String(64))
+    correlation_id: Mapped[str | None] = mapped_column(String(128))
+    causation_id: Mapped[str | None] = mapped_column(String(64))
+    step_id: Mapped[str | None] = mapped_column(String(128))
+    attributes: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+
 class AgentBehaviorEvent(Base):
     __tablename__ = "agent_behavior_events"
 
@@ -263,6 +294,42 @@ class ExecutionEvent(Base):
     details: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
 
     event: Mapped[Event] = relationship(back_populates="execution_detail")
+
+
+class PersistedSignal(Base):
+    __tablename__ = "persisted_signals"
+    __table_args__ = (
+        CheckConstraint("scope IN ('run', 'evaluation', 'window')", name="ck_persisted_signal_scope"),
+        CheckConstraint(
+            "(scope <> 'run' OR (run_id IS NOT NULL AND evaluation_run_id IS NULL AND window_start IS NULL AND window_end IS NULL)) AND "
+            "(scope <> 'evaluation' OR (evaluation_run_id IS NOT NULL AND run_id IS NULL AND window_start IS NULL AND window_end IS NULL)) AND "
+            "(scope <> 'window' OR (window_start IS NOT NULL AND window_end IS NOT NULL AND window_start < window_end AND run_id IS NULL))",
+            name="ck_persisted_signal_shape",
+        ),
+        Index("ix_persisted_signals_agent_time", "agent_id", "detected_at"),
+        Index("ix_persisted_signals_type_time", "signal_type", "detected_at"),
+        Index("uq_persisted_signals_dedupe_key", "dedupe_key", unique=True),
+        Index("uq_persisted_signal_source_projection", "source_event_id", "origin", "projection_version", unique=True),
+    )
+
+    signal_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    origin: Mapped[str] = mapped_column(String(32), nullable=False, default="detector", server_default="detector", index=True)
+    source_event_id: Mapped[str | None] = mapped_column(ForeignKey("events.event_id", ondelete="CASCADE"), index=True)
+    source_observation_id: Mapped[str | None] = mapped_column(ForeignKey("event_observations.observation_id", ondelete="CASCADE"), index=True)
+    projection_version: Mapped[str | None] = mapped_column(String(32))
+    agent_id: Mapped[str] = mapped_column(ForeignKey("agents.agent_id", ondelete="RESTRICT"), nullable=False, index=True)
+    signal_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    scope: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    run_id: Mapped[str | None] = mapped_column(ForeignKey("runs.run_id", ondelete="CASCADE"), index=True)
+    evaluation_run_id: Mapped[str | None] = mapped_column(ForeignKey("evaluation_runs.evaluation_run_id", ondelete="CASCADE"), index=True)
+    window_start: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    window_end: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    recorded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, server_default=func.now())
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    payload_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    detector_name: Mapped[str | None] = mapped_column(String(255))
+    dedupe_key: Mapped[str | None] = mapped_column(String(64))
 
 
 class PolicyDecision(Base):
@@ -614,5 +681,6 @@ __all__ = [
     "Event", "AgentBehaviorEvent", "ContextEvent", "ContextResource", "ExecutionEvent", "PolicyDecision",
     "Dataset", "DatasetVersion", "EvaluationCase", "EvaluationRun", "EvaluationResult",
     "MLModel", "ModelVersion", "PipelineVersion", "PipelineComponent", "Experiment", "TrainingRun",
+    "PersistedSignal",
     "Analysis", "DifferentialAnalysis", "DriftAnalysis", "RootCauseAnalysis", "Artifact", "Lineage", "OutboxEvent",
 ]

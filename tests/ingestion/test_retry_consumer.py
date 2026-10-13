@@ -418,6 +418,62 @@ def test_loop_pauses_each_partition_once():
     assert source.paused == [(RETRY_TOPIC, 0)]
 
 
+def test_loop_resumes_partition_when_deferred_record_becomes_due():
+    due_at = NOW + timedelta(minutes=5)
+    now = [NOW]
+    record = make_retry_record(due_at=due_at, partition=2)
+
+    class AdvancingRetrySource(FakeRetrySource):
+        def __init__(self):
+            super().__init__()
+            self.poll_count = 0
+            self.partition_paused = False
+
+        def poll(self, timeout_s: float) -> list[KafkaRecord]:
+            self.poll_count += 1
+            if self.poll_count == 1:
+                return [record]
+            if self.poll_count == 2:
+                now[0] = due_at
+                return []
+            if self.poll_count == 3 and not self.partition_paused:
+                return [record]
+            return []
+
+        def pause(self, topic: str, partition: int) -> None:
+            super().pause(topic, partition)
+            self.partition_paused = True
+
+        def resume(self, topic: str, partition: int) -> None:
+            super().resume(topic, partition)
+            self.partition_paused = False
+
+    source = AdvancingRetrySource()
+    producer = RecordingProducer()
+    dispatcher = RetryDispatcher(
+        producer=producer,
+        main_topic=MAIN_TOPIC,
+        dlq_topic=DLQ_TOPIC,
+        max_attempts=5,
+        clock=lambda: now[0],
+    )
+    loop = RetryConsumerLoop(
+        source=source,
+        dispatcher=dispatcher,
+        clock=lambda: now[0],
+    )
+
+    outcomes = loop.run(max_records=2, idle_poll_limit=2)
+
+    assert [outcome.action for outcome in outcomes] == [
+        DispatchAction.DEFERRED,
+        DispatchAction.FORWARDED,
+    ]
+    assert source.paused == [(RETRY_TOPIC, 2)]
+    assert source.resumed == [(RETRY_TOPIC, 2)]
+    assert source.committed_positions() == [(RETRY_TOPIC, 2, 6)]
+
+
 def test_loop_does_not_sleep_while_deferring():
     import time
 

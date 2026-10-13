@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, TypeVar
 
-from sqlalchemy import func, inspect, select
+from sqlalchemy import func, inspect, or_, select, update
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -23,12 +23,14 @@ from .models import (
     EvaluationResult,
     EvaluationRun,
     Event,
+    EventObservation,
     ExecutionEvent,
     Experiment,
     Lineage,
     MLModel,
     ModelVersion,
     OutboxEvent,
+    PersistedSignal,
     PipelineComponent,
     PipelineVersion,
     Policy,
@@ -77,6 +79,37 @@ def _dialect_insert(session: Session):
     raise RepositoryError(
         f"Idempotent insert/upsert is not supported for dialect '{dialect}'."
     )
+
+
+def _snapshot_row(obj: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {}
+
+    for attribute in inspect(type(obj)).mapper.column_attrs:
+        value = getattr(obj, attribute.key)
+
+        if value is None:
+            continue
+
+        for column in attribute.columns:
+            row[column.key] = value
+
+    return row
+
+
+def _signal_row(row: PersistedSignal) -> dict[str, Any]:
+    values = _snapshot_row(row)
+    values.setdefault("run_id", None)
+    values.setdefault("evaluation_run_id", None)
+    values.setdefault("window_start", None)
+    values.setdefault("window_end", None)
+    values.setdefault("detector_name", None)
+    values.setdefault("payload", {})
+    values.setdefault("origin", "detector")
+    values.setdefault("source_event_id", None)
+    values.setdefault("source_observation_id", None)
+    values.setdefault("projection_version", None)
+
+    return values
 
 
 # ============================================================================
@@ -221,6 +254,8 @@ class RunRepository:
         run_id: str,
         status: str,
         completed_at: datetime | None = None,
+        error_type: str | None = None,
+        error_message: str | None = None,
     ) -> Run:
         run = self.get_required(run_id)
 
@@ -229,9 +264,123 @@ class RunRepository:
         if completed_at is not None:
             run.completed_at = completed_at
 
+        if error_type is not None:
+            run.error_type = error_type
+
+        if error_message is not None:
+            run.error_message = error_message
+
         self.session.flush()
 
         return run
+
+    def claim_monitoring(
+        self,
+        run_id: str,
+        claim_id: str,
+        *,
+        claimed_at: datetime,
+        expires_at: datetime,
+    ) -> bool:
+        statement = (
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.status != "failed",
+                Run.monitoring_completed_at.is_(None),
+                or_(
+                    Run.monitoring_claim_expires_at.is_(None),
+                    Run.monitoring_claim_expires_at <= claimed_at,
+                ),
+            )
+            .values(
+                monitoring_claim_id=claim_id,
+                monitoring_claim_expires_at=expires_at,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+        result = self.session.execute(statement)
+        self.session.flush()
+
+        return bool(result.rowcount and result.rowcount > 0)
+
+    def release_monitoring_claim(self, run_id: str, claim_id: str) -> bool:
+        statement = (
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.monitoring_claim_id == claim_id,
+            )
+            .values(
+                monitoring_claim_id=None,
+                monitoring_claim_expires_at=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+        result = self.session.execute(statement)
+        self.session.flush()
+
+        return bool(result.rowcount and result.rowcount > 0)
+
+    def mark_monitoring_completed(
+        self,
+        run_id: str,
+        monitoring_completed_at: datetime,
+        claim_id: str,
+    ) -> bool:
+        statement = (
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.monitoring_completed_at.is_(None),
+                Run.monitoring_claim_id == claim_id,
+            )
+            .values(
+                monitoring_completed_at=monitoring_completed_at,
+                monitoring_claim_id=None,
+                monitoring_claim_expires_at=None,
+            )
+            .execution_options(synchronize_session=False)
+        )
+
+        result = self.session.execute(statement)
+        self.session.flush()
+
+        return bool(result.rowcount and result.rowcount > 0)
+
+    def mark_failed(
+        self,
+        run_id: str,
+        *,
+        completed_at: datetime,
+        error_type: str,
+        error_message: str | None = None,
+    ) -> bool:
+        values: dict[str, Any] = {
+            "status": "failed",
+            "completed_at": completed_at,
+            "error_type": error_type,
+        }
+
+        if error_message is not None:
+            values["error_message"] = error_message
+
+        statement = (
+            update(Run)
+            .where(
+                Run.run_id == run_id,
+                Run.status.notin_(("completed", "failed")),
+            )
+            .values(**values)
+            .execution_options(synchronize_session=False)
+        )
+
+        result = self.session.execute(statement)
+        self.session.flush()
+
+        return bool(result.rowcount and result.rowcount > 0)
 
 
 # ============================================================================
@@ -303,11 +452,14 @@ class EventRepository:
     def create(self, event: Event) -> Event:
         self.session.add(event)
         self.session.flush()
+        self._project_event_by_id(event.event_id)
         return event
 
     def create_many(self, events: list[Event]) -> list[Event]:
         self.session.add_all(events)
         self.session.flush()
+        for event in events:
+            self._project_event_by_id(event.event_id)
         return events
 
     def insert_ignore_duplicates(self, events: list[Event]) -> int:
@@ -342,6 +494,11 @@ class EventRepository:
 
         result = self.session.execute(statement)
         self.session.flush()
+
+        # Projection is coupled to the repository's event write path, not to
+        # detector execution. Canonical stored rows are used on redelivery.
+        for event in events:
+            self._project_event_by_id(event.event_id)
 
         rowcount = result.rowcount
 
@@ -385,8 +542,77 @@ class EventRepository:
             sequence = self.next_sequence_number(envelope.run_id)
 
         event = event_from_envelope(envelope, sequence_number=sequence)
-
         return self.insert_ignore_duplicates([event])
+
+    def _project_event_by_id(self, event_id: str) -> None:
+        """Idempotently persist an event's Observation and base Signal."""
+        canonical_event = self.get(event_id)
+        if canonical_event is None:
+            raise RepositoryError(
+                f"Event '{event_id}' was not available after persistence."
+            )
+        run = self.session.get(Run, canonical_event.run_id)
+        if run is None:
+            raise RepositoryError(
+                f"Run '{canonical_event.run_id}' for event '{canonical_event.event_id}' does not exist."
+            )
+
+        from ..monitoring.observations.projector import project_event
+        from ..monitoring.persistence import signal_to_record
+
+        observation, base_signal = project_event(canonical_event, agent_id=run.agent_id)
+        self._persist_observation(observation)
+        record = signal_to_record(base_signal)
+        record = record.model_copy(
+            update={"dedupe_key": self._base_signal_dedupe_key(record)}
+        )
+        self._persist_base_signal(record)
+
+    @staticmethod
+    def _base_signal_dedupe_key(record: Any) -> str:
+        from ..monitoring.persistence import signal_dedupe_key
+
+        return signal_dedupe_key(record)
+
+    def _persist_observation(self, observation: Any) -> None:
+        values = {
+            "observation_id": observation.observation_id,
+            "source_event_id": observation.source_event_id,
+            "projection_version": observation.projection_version,
+            "agent_id": observation.agent_id,
+            "run_id": observation.run_id,
+            "event_type": observation.event_type,
+            "system_id": observation.system_id,
+            "system_version": observation.system_version,
+            "occurred_at": observation.occurred_at,
+            "observed_at": observation.observed_at,
+            "sequence_number": observation.sequence_number,
+            "parent_event_id": observation.parent_event_id,
+            "correlation_id": observation.correlation_id,
+            "causation_id": observation.causation_id,
+            "step_id": observation.step_id,
+            "attributes": observation.attributes,
+        }
+        statement = (
+            _dialect_insert(self.session)(EventObservation)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=["observation_id"])
+        )
+        self.session.execute(statement)
+        self.session.flush()
+
+    def _persist_base_signal(self, record: Any) -> None:
+        from ..monitoring_integration import persisted_signal_from_record
+
+        row = persisted_signal_from_record(record)
+        values = _signal_row(row)
+        statement = (
+            _dialect_insert(self.session)(PersistedSignal)
+            .values(values)
+            .on_conflict_do_nothing(index_elements=["signal_id"])
+        )
+        self.session.execute(statement)
+        self.session.flush()
 
     def get(self, event_id: str) -> Event | None:
         return self.session.get(Event, event_id)
@@ -506,18 +732,7 @@ class EventRepository:
         Attributes still at ``None`` are omitted so the column's Python-side
         or server-side default applies, exactly as it would on flush.
         """
-        row: dict[str, Any] = {}
-
-        for attribute in inspect(type(obj)).mapper.column_attrs:
-            value = getattr(obj, attribute.key)
-
-            if value is None:
-                continue
-
-            for column in attribute.columns:
-                row[column.key] = value
-
-        return row
+        return _snapshot_row(obj)
 
     def insert_with_detail_ignore_duplicates(
         self,
@@ -599,6 +814,135 @@ class EventRepository:
             .where(Event.event_type == event_type)
             .order_by(Event.occurred_at.desc())
             .limit(limit)
+        )
+
+        return list(self.session.scalars(statement))
+
+
+# ============================================================================
+# Persisted Signal
+# ============================================================================
+
+
+class PersistedSignalRepository:
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def insert_ignore_duplicates(self, rows: list[PersistedSignal]) -> int:
+        if not rows:
+            return 0
+
+        values = [_signal_row(row) for row in rows]
+
+        statement = (
+            _dialect_insert(self.session)(PersistedSignal)
+            .values(values)
+            .on_conflict_do_nothing()
+        )
+
+        result = self.session.execute(statement)
+        self.session.flush()
+
+        rowcount = result.rowcount
+
+        return int(rowcount) if rowcount is not None and rowcount >= 0 else 0
+
+    def get(self, signal_id: str) -> PersistedSignal | None:
+        return self.session.get(PersistedSignal, signal_id)
+
+    def list_for_run(
+        self,
+        run_id: str,
+        *,
+        agent_id: str | None = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[PersistedSignal]:
+        statement = select(PersistedSignal).where(PersistedSignal.run_id == run_id)
+
+        if agent_id is not None:
+            statement = statement.where(PersistedSignal.agent_id == agent_id)
+
+        statement = (
+            statement.order_by(PersistedSignal.detected_at.asc(), PersistedSignal.signal_id.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+
+        return list(self.session.scalars(statement))
+
+    def list_for_evaluation_run(
+        self,
+        evaluation_run_id: str,
+        *,
+        agent_id: str | None = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[PersistedSignal]:
+        statement = select(PersistedSignal).where(
+            PersistedSignal.evaluation_run_id == evaluation_run_id
+        )
+
+        if agent_id is not None:
+            statement = statement.where(PersistedSignal.agent_id == agent_id)
+
+        statement = (
+            statement.order_by(PersistedSignal.detected_at.asc(), PersistedSignal.signal_id.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+
+        return list(self.session.scalars(statement))
+
+    def list_for_agent(
+        self,
+        agent_id: str,
+        *,
+        signal_type: str | None = None,
+        detected_after: datetime | None = None,
+        detected_before: datetime | None = None,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[PersistedSignal]:
+        statement = select(PersistedSignal).where(PersistedSignal.agent_id == agent_id)
+
+        if signal_type is not None:
+            statement = statement.where(PersistedSignal.signal_type == signal_type)
+
+        if detected_after is not None:
+            statement = statement.where(PersistedSignal.detected_at >= detected_after)
+
+        if detected_before is not None:
+            statement = statement.where(PersistedSignal.detected_at <= detected_before)
+
+        statement = (
+            statement.order_by(PersistedSignal.detected_at.asc(), PersistedSignal.signal_id.asc())
+            .limit(limit)
+            .offset(offset)
+        )
+
+        return list(self.session.scalars(statement))
+
+    def list_for_window(
+        self,
+        agent_id: str,
+        window_start: datetime,
+        window_end: datetime,
+        *,
+        limit: int = 1000,
+        offset: int = 0,
+    ) -> list[PersistedSignal]:
+        statement = (
+            select(PersistedSignal)
+            .where(
+                PersistedSignal.agent_id == agent_id,
+                PersistedSignal.detected_at >= window_start,
+                PersistedSignal.detected_at < window_end,
+            )
+            .order_by(PersistedSignal.detected_at.asc(), PersistedSignal.signal_id.asc())
+            .limit(limit)
+            .offset(offset)
         )
 
         return list(self.session.scalars(statement))
@@ -966,10 +1310,6 @@ class EvaluationResultRepository:
         return list(self.session.scalars(statement))
 
 
-# ============================================================================
-# ML Model
-# ============================================================================
-
 
 class MLModelRepository:
 
@@ -1029,10 +1369,6 @@ class ModelVersionRepository:
         return list(self.session.scalars(statement))
 
 
-# ============================================================================
-# Pipeline
-# ============================================================================
-
 
 class PipelineRepository:
 
@@ -1076,10 +1412,6 @@ class PipelineRepository:
 
         return list(self.session.scalars(statement))
 
-
-# ============================================================================
-# Experiment / Training
-# ============================================================================
 
 
 class ExperimentRepository:
@@ -1170,9 +1502,6 @@ class TrainingRunRepository:
         return run
 
 
-# ============================================================================
-# Analysis
-# ============================================================================
 
 
 class AnalysisRepository:
@@ -1338,10 +1667,6 @@ class RootCauseAnalysisRepository:
 
         return self.session.scalar(statement)
 
-
-# ============================================================================
-# Artifact
-# ============================================================================
 
 
 class ArtifactRepository:

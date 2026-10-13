@@ -31,12 +31,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
 
 from .kafka_record import KafkaRecord
 from .producer import TopicPosition
-from .retry_dispatcher import DispatchAction, DispatchOutcome, RetryDispatcher
+from .retry_dispatcher import (
+    DispatchAction,
+    DispatchOutcome,
+    MalformedRetryError,
+    RetryDispatcher,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +103,7 @@ class RetryConsumerLoop:
         self._stopped = False
         # Partitions currently paused because their head record is not due.
         self._paused: set[tuple[str, int]] = set()
+        self._resume_at: dict[tuple[str, int], datetime] = {}
 
     def stop(self) -> None:
         self._stopped = True
@@ -128,6 +134,7 @@ class RetryConsumerLoop:
                 ):
                     break
 
+                self._resume_due_partitions()
                 records = self._source.poll(
                     self._config.poll_timeout_seconds
                 )
@@ -165,12 +172,33 @@ class RetryConsumerLoop:
         # FORWARDED or DEAD_LETTERED: the record reached a durable
         # destination, so the retry-topic offset may be committed.
         self._source.commit([self._dispatcher.commit_position(record)])
-        self._paused.discard((record.topic, record.partition))
+        key = (record.topic, record.partition)
+        self._resume_at.pop(key, None)
+        if key in self._paused:
+            self._source.resume(*key)
+            self._paused.discard(key)
 
         return outcome
 
     def _defer(self, record: KafkaRecord) -> None:
         key = (record.topic, record.partition)
+        now = self._clock()
+
+        try:
+            due_at = self._dispatcher.parse(record).due_at
+        except MalformedRetryError:
+            # Malformed records may be deferred when DLQ publishing fails.
+            due_at = None
+
+        if due_at is None or due_at <= now:
+            due_at = now + timedelta(
+                seconds=(
+                    self._config.poll_timeout_seconds
+                    * self._config.max_defer_polls
+                )
+            )
+
+        self._resume_at[key] = due_at
 
         if key not in self._paused:
             self._source.pause(record.topic, record.partition)
@@ -182,6 +210,19 @@ class RetryConsumerLoop:
                 record.partition,
                 record.offset,
             )
+
+    def _resume_due_partitions(self) -> None:
+        now = self._clock()
+        due_keys = [
+            key
+            for key, resume_at in self._resume_at.items()
+            if resume_at <= now
+        ]
+
+        for key in due_keys:
+            self._source.resume(*key)
+            self._paused.discard(key)
+            self._resume_at.pop(key, None)
 
     def summary(
         self,

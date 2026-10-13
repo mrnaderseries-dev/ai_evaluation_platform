@@ -68,10 +68,11 @@ class MetricCalculator:
         percentile: float = 0.95,
         unit: str = "ms",
     ) -> SystemMetric:
+        items = list(telemetry)
 
         values = [
             item.value
-            for item in telemetry
+            for item in items
             if item.value is not None
         ]
 
@@ -110,6 +111,6 @@ class MetricCalculator:
             unit=unit,
             timestamp=max(
                 item.timestamp
-                for item in telemetry
+                for item in items
             ),
         )

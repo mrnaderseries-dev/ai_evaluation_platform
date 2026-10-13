@@ -19,3 +19,10 @@ class GroundednessJudge:
         score = self._parse_score(response)
 
         return max(0.0, min(1.0, score))
+
+    def _build_prompt(self, *, answer: str, context: tuple) -> str:
+        items = "\n".join(str(item) for item in context)
+        return f"Answer: {answer}\nContext:\n{items}"
+
+    def _parse_score(self, response: object) -> float:
+        return float(str(response).strip())

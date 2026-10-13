@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 from ..components.types import ComponentType
 from ..metrics.types import MetricDimension
+from .models import AlertSeverity
 
 
 @dataclass(frozen=True)
@@ -15,7 +16,7 @@ class MetricThresholdRule:
 
     threshold: float
 
-    severity: str
+    severity: AlertSeverity
 
     comparison: str = "gt"
 

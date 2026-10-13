@@ -39,6 +39,7 @@ from ai_eval_platform.storage.models import (
     ContextResource,
     Event,
     EvaluationResult,
+    PersistedSignal,
     Run,
     utc_now,
 )
@@ -46,6 +47,7 @@ from ai_eval_platform.storage.repositories import (
     ContextEventRepository,
     EventRepository,
     EvaluationResultRepository,
+    PersistedSignalRepository,
 )
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -109,9 +111,10 @@ def _event(event_id: str, sequence_number: int = 1) -> Event:
 def test_create_all_creates_full_schema_on_postgres(pg_engine):
     tables = set(inspect(pg_engine).get_table_names())
     assert "events" in tables
+    assert "persisted_signals" in tables
     assert "context_resources" in tables
     assert "policy_versions" in tables
-    assert len(tables) == 30
+    assert len(tables) == 31
 
     # The renamed metadata column exists with its DB column name.
     agent_columns = {c["name"] for c in inspect(pg_engine).get_columns("agents")}
@@ -198,6 +201,66 @@ def test_evaluation_result_upsert_on_postgres(pg_session, pg_run):
     assert rows[0].score == 0.9
     # On conflict the original primary key is preserved.
     assert rows[0].evaluation_result_id == "res-pg-1"
+
+    pg_session.rollback()
+
+
+def test_signal_idempotency_and_foreign_keys_on_postgres(pg_session, pg_run):
+    repo = PersistedSignalRepository(pg_session)
+
+    row = PersistedSignal(
+        signal_id="pg-sig-1",
+        agent_id="agent-pg",
+        signal_type="repeated_tool_usage",
+        scope="run",
+        run_id="run-pg",
+        detected_at=utc_now(),
+        payload={"tool_name": "search"},
+        payload_type="RepeatedToolUsagePayload",
+        detector_name="pattern",
+    )
+
+    assert repo.insert_ignore_duplicates([row]) == 1
+    assert repo.insert_ignore_duplicates([row]) == 0
+    assert pg_session.scalar(select(func.count()).select_from(PersistedSignal)) == 1
+
+    stored = repo.get("pg-sig-1")
+    assert stored.detector_name == "pattern"
+    assert stored.payload == {"tool_name": "search"}
+
+    pg_session.add(
+        PersistedSignal(
+            signal_id="pg-sig-orphan",
+            agent_id="agent-pg",
+            signal_type="repeated_tool_usage",
+            scope="run",
+            run_id="run-absent",
+            detected_at=utc_now(),
+            payload={},
+            payload_type="RepeatedToolUsagePayload",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        pg_session.flush()
+
+    pg_session.rollback()
+
+    pg_session.add(
+        PersistedSignal(
+            signal_id="pg-sig-stray",
+            agent_id="agent-absent",
+            signal_type="repeated_tool_usage",
+            scope="run",
+            run_id="run-pg",
+            detected_at=utc_now(),
+            payload={},
+            payload_type="RepeatedToolUsagePayload",
+        )
+    )
+
+    with pytest.raises(IntegrityError):
+        pg_session.flush()
 
     pg_session.rollback()
 

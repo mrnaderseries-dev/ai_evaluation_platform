@@ -3,7 +3,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import StaticPool
 
@@ -37,8 +37,12 @@ from ai_eval_platform.monitoring_integration import (
     load_run_monitoring_context,
     monitor_completed_run,
 )
-from ai_eval_platform.storage.models import Agent, Base, Event, Run
-from ai_eval_platform.storage.repositories import EntityNotFoundError, EventRepository
+from ai_eval_platform.storage.models import Agent, Base, Event, PersistedSignal, Run
+from ai_eval_platform.storage.repositories import (
+    EntityNotFoundError,
+    EventRepository,
+    PersistedSignalRepository,
+)
 from schemas.events.common import EventType
 
 
@@ -442,6 +446,63 @@ def test_multiple_applicable_detectors_run_together(engine, session_factory):
     assert confidence_signal.payload.current_value == 0.6
     assert confidence_signal.payload.baseline == 0.9
 
+
+
+def test_monitor_completed_run_persists_signals_to_database(engine, session_factory):
+    _seed_run(
+        engine,
+        "run-1",
+        events=[
+            _tool_called("run-1", 1, "evt-t1", "search", "c1"),
+            _tool_called("run-1", 2, "evt-t2", "search", "c2"),
+        ],
+    )
+
+    result = monitor_completed_run("run-1", session_factory=session_factory)
+    assert len(result.signals) == 1
+
+    with Session(engine, expire_on_commit=False) as session:
+        rows = session.scalars(select(PersistedSignal)).all()
+
+    assert len(rows) == 1
+    stored = rows[0]
+    expected = result.signals[0]
+    assert stored.signal_id == expected.signal_id
+    assert stored.agent_id == "agent-1"
+    assert stored.run_id == "run-1"
+    assert stored.signal_type == expected.signal_type.value
+    assert stored.detector_name == "pattern"
+    assert stored.evaluation_run_id is None
+    assert stored.window_start is None
+    assert stored.window_end is None
+    assert stored.payload_type is not None
+
+
+def test_monitor_completed_run_persistence_failure_rolls_back(engine, session_factory):
+    _seed_run(
+        engine,
+        "run-1",
+        events=[
+            _tool_called("run-1", 1, "evt-t1", "search", "c1"),
+            _tool_called("run-1", 2, "evt-t2", "search", "c2"),
+        ],
+    )
+
+    original = PersistedSignalRepository.insert_ignore_duplicates
+
+    def failing(self, rows):
+        raise RuntimeError("persistence failure")
+
+    PersistedSignalRepository.insert_ignore_duplicates = failing
+
+    try:
+        with pytest.raises(RuntimeError, match="persistence failure"):
+            monitor_completed_run("run-1", session_factory=session_factory)
+    finally:
+        PersistedSignalRepository.insert_ignore_duplicates = original
+
+    with Session(engine, expire_on_commit=False) as session:
+        assert session.scalar(select(func.count()).select_from(PersistedSignal)) == 0
 
 
 def test_boundary_requires_completed_run(engine, session_factory):

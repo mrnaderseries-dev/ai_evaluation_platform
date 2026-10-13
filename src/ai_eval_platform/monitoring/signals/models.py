@@ -4,10 +4,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from .types import (
     ConfidenceDropPayload,
+    EventObservationPayload,
     ErrorPatternPayload,
     LatencyAnomalyPayload,
     RepeatedToolUsagePayload,
     RouteChangePayload,
+    SignalOrigin,
     SignalScope,
     SignalType,
     ToolUsageDriftPayload,
@@ -15,7 +17,8 @@ from .types import (
 
 
 PayloadType = (
-    LatencyAnomalyPayload
+    EventObservationPayload
+    | LatencyAnomalyPayload
     | RouteChangePayload
     | ConfidenceDropPayload
     | RepeatedToolUsagePayload
@@ -31,6 +34,10 @@ class Signal(BaseModel):
     )
 
     signal_id: str = Field(min_length=1)
+    origin: SignalOrigin = SignalOrigin.DETECTOR
+    source_event_id: str | None = Field(default=None, min_length=1)
+    source_observation_id: str | None = Field(default=None, min_length=1)
+    projection_version: str | None = Field(default=None, min_length=1)
     agent_id: str = Field(min_length=1)
     signal_type: SignalType
     scope: SignalScope
@@ -42,12 +49,12 @@ class Signal(BaseModel):
     payload: PayloadType
 
     @field_validator("window_start", "window_end", "detected_at")
-
     @classmethod
     def require_timezone_aware(cls, value: datetime | None) -> datetime | None:
         if value is not None and (value.tzinfo is None or value.utcoffset() is None):
             raise ValueError("monitoring timestamps must be timezone-aware")
         return value
+
     @model_validator(mode="after")
     def validate_scope(self) -> "Signal":
         if self.scope is SignalScope.RUN:
@@ -101,6 +108,7 @@ class Signal(BaseModel):
     @model_validator(mode="after")
     def validate_payload_matches_type(self) -> "Signal":
         expected_payload = {
+            SignalType.EVENT_OBSERVATION: EventObservationPayload,
             SignalType.LATENCY_ANOMALY: LatencyAnomalyPayload,
             SignalType.ROUTE_CHANGE: RouteChangePayload,
             SignalType.CONFIDENCE_DROP: ConfidenceDropPayload,
@@ -114,5 +122,13 @@ class Signal(BaseModel):
                 f"signal_type={self.signal_type.value!r} requires "
                 f"payload type {expected_payload.__name__}"
             )
+
+        if self.signal_type is SignalType.EVENT_OBSERVATION:
+            if self.origin is not SignalOrigin.BASE_OBSERVATION:
+                raise ValueError("event_observation signals must use base_observation origin")
+            if not self.source_event_id or not self.source_observation_id or not self.projection_version:
+                raise ValueError("base observation signals require source event, observation, and projection version")
+        elif self.origin is SignalOrigin.BASE_OBSERVATION:
+            raise ValueError("base_observation origin requires event_observation signal type")
 
         return self

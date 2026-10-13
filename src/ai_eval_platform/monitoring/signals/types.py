@@ -12,12 +12,38 @@ class SignalScope(str, Enum):
 
 
 class SignalType(str, Enum):
+    EVENT_OBSERVATION = "event_observation"
     LATENCY_ANOMALY = "latency_anomaly"
     ROUTE_CHANGE = "route_change"
     CONFIDENCE_DROP = "confidence_drop"
     REPEATED_TOOL_USAGE = "repeated_tool_usage"
     TOOL_USAGE_DRIFT = "tool_usage_drift"
     ERROR_PATTERN = "error_pattern"
+
+
+class SignalOrigin(str, Enum):
+    BASE_OBSERVATION = "base_observation"
+    DETECTOR = "detector"
+    ANALYSIS = "analysis"
+
+
+class EventObservationPayload(BaseModel):
+    """Non-anomalous fact that a source event was observed and normalized."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    observation_id: str = Field(min_length=1)
+    source_event_id: str = Field(min_length=1)
+    event_type: str = Field(min_length=1)
+    occurred_at: datetime
+    sequence_number: int = Field(ge=0)
+
+    @field_validator("occurred_at")
+    @classmethod
+    def timestamp_must_be_timezone_aware(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("occurred_at must be timezone-aware")
+        return value
 
 
 class SignalPayload(BaseModel):
