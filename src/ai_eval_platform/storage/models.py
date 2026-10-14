@@ -331,7 +331,172 @@ class PersistedSignal(Base):
     detector_name: Mapped[str | None] = mapped_column(String(255))
     dedupe_key: Mapped[str | None] = mapped_column(String(64))
 
+class PersistedEvidenceRecord(Base):
+    """Durable, agent-agnostic evidence registry."""
 
+    __tablename__ = "evidence_records"
+    __table_args__ = (
+        Index("ix_evidence_domain_observed", "domain", "observed_at"),
+        Index("ix_evidence_subject_observed",
+              "subject_type", "subject_id", "observed_at"),
+        Index("ix_evidence_agent_observed", "agent_id", "observed_at"),
+        Index("ix_evidence_system_observed", "system_id", "observed_at"),
+        Index("ix_evidence_run", "run_id"),
+        Index("ix_evidence_evaluation_run", "evaluation_run_id"),
+    )
+
+    evidence_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True
+    )
+
+    # Polymorphic source: signal, event, trace, metric, log, etc.
+    source: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_ref: Mapped[str] = mapped_column(String(255), nullable=False)
+    evidence_kind: Mapped[str] = mapped_column(String(100), nullable=False)
+    domain: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Evidence may describe an agent, service, model, component, or system.
+    subject_type: Mapped[str] = mapped_column(String(100), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    agent_id: Mapped[str | None] = mapped_column(String(64), index=True)
+
+    system_id: Mapped[str | None] = mapped_column(String(255))
+    system_version: Mapped[str | None] = mapped_column(String(100))
+    run_id: Mapped[str | None] = mapped_column(String(64))
+    evaluation_run_id: Mapped[str | None] = mapped_column(String(64))
+
+    trace_id: Mapped[str | None] = mapped_column(String(128))
+    span_id: Mapped[str | None] = mapped_column(String(128))
+    parent_span_id: Mapped[str | None] = mapped_column(String(128))
+    component_id: Mapped[str | None] = mapped_column(String(255))
+
+    observed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    attributes: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    limitations: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+    source_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class PersistedRelationship(Base):
+    """A versioned analytical relationship; never assumed causal by default."""
+
+    __tablename__ = "persisted_relationships"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('candidate', 'validated', 'rejected')",
+            name="ck_persisted_relationship_status",
+        ),
+        UniqueConstraint(
+            "analysis_id", "relationship_key",
+            name="uq_relationship_analysis_key",
+        ),
+        Index("ix_relationship_status_discovered", "status", "discovered_at"),
+        Index("ix_relationship_type_discovered",
+              "relationship_type", "discovered_at"),
+    )
+
+    relationship_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=new_id
+    )
+
+    # Analysis provenance: re-analysis creates a distinct historical result.
+    analysis_id: Mapped[str] = mapped_column(
+        ForeignKey("analyses.analysis_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
+    relationship_key: Mapped[str] = mapped_column(
+        String(128), nullable=False
+    )
+
+    relationship_type: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+    basis: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Detection produces candidates; validation must be an explicit action.
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="candidate", server_default="candidate"
+    )
+
+    algorithm_name: Mapped[str] = mapped_column(
+        String(255), nullable=False
+    )
+    algorithm_version: Mapped[str] = mapped_column(
+        String(100), nullable=False
+    )
+
+    # Only common scope belongs here. Per-evidence scope stays on each record.
+    scope: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    attributes: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False, default=dict
+    )
+    limitations: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
+
+    discovered_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now
+    )
+    validated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    validated_by: Mapped[str | None] = mapped_column(String(255))
+    validation_notes: Mapped[str | None] = mapped_column(Text)
+
+
+class RelationshipEvidence(Base):
+    """Explicit, ordered evidence links for a persisted relationship."""
+
+    __tablename__ = "relationship_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            "role IN ('supporting', 'counter', 'context')",
+            name="ck_relationship_evidence_role",
+        ),
+        UniqueConstraint(
+            "relationship_id", "evidence_id", "role",
+            name="uq_relationship_evidence_role",
+        ),
+        Index("ix_relationship_evidence_evidence", "evidence_id"),
+    )
+
+    relationship_evidence_id: Mapped[str] = mapped_column(
+        String(64), primary_key=True, default=new_id
+    )
+    relationship_id: Mapped[str] = mapped_column(
+        ForeignKey(
+            "persisted_relationships.relationship_id",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
+    evidence_id: Mapped[str] = mapped_column(
+        ForeignKey("evidence_records.evidence_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(
+        String(32), nullable=False
+    )
+    evidence_order: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 class PolicyDecision(Base):
     __tablename__ = "policy_decisions"
     __table_args__ = (
@@ -682,5 +847,6 @@ __all__ = [
     "Dataset", "DatasetVersion", "EvaluationCase", "EvaluationRun", "EvaluationResult",
     "MLModel", "ModelVersion", "PipelineVersion", "PipelineComponent", "Experiment", "TrainingRun",
     "PersistedSignal",
+    "PersistedEvidenceRecord", "PersistedRelationship", "RelationshipEvidence",
     "Analysis", "DifferentialAnalysis", "DriftAnalysis", "RootCauseAnalysis", "Artifact", "Lineage", "OutboxEvent",
 ]

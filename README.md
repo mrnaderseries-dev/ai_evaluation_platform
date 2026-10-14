@@ -43,6 +43,7 @@ DATABASE_URL=postgresql+psycopg://user:pass@localhost:5432/ai_eval_storage_test 
 | Path | Installed? | Purpose |
 | --- | --- | --- |
 | `src/ai_eval_platform/` | yes | The distributable package (`storage/` is implemented) |
+| `src/ai_eval_platform/statistics/` | yes | Statistical primitives and evaluation-result summaries |
 | `schemas/` | no | Event schema contracts; a repository-level package |
 | `sdk/`, `producers/`, `batch/`, `ml/` | no | Repository-level modules/scripts (currently empty placeholders) |
 
@@ -61,6 +62,8 @@ current code imports:
 | --- | --- |
 | `pydantic>=2.0` | `schemas/events/*` |
 | `SQLAlchemy>=2.0` | `src/ai_eval_platform/storage/*` |
+| `numpy>=1.26` | `src/ai_eval_platform/statistics/*` (numerical summaries) |
+| `scipy>=1.11` | `src/ai_eval_platform/statistics/*` (hypothesis tests and intervals) |
 | `psycopg[binary]>=3.1` | PostgreSQL driver required by the storage layer to connect |
 
 Development dependencies (`pip install -e ".[dev]"`) are `pytest>=8.0`, which

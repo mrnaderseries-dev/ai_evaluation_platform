@@ -6,7 +6,10 @@ import pytest
 from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
-from ai_eval_platform.monitoring.persistence import signal_to_record
+from ai_eval_platform.monitoring.persistence import (
+    signal_dedupe_key,
+    signal_to_record,
+)
 from ai_eval_platform.monitoring.signals.models import Signal
 from ai_eval_platform.monitoring.signals.types import (
     ErrorPatternPayload,
@@ -23,12 +26,18 @@ from ai_eval_platform.storage.models import (
     AgentVersion,
     Dataset,
     DatasetVersion,
+    Event,
     EvaluationCase,
     EvaluationRun,
+    PersistedEvidenceRecord,
     PersistedSignal,
     Run,
 )
-from ai_eval_platform.storage.repositories import PersistedSignalRepository
+from ai_eval_platform.storage.repositories import (
+    EvidenceRepository,
+    PersistedSignalRepository,
+    RepositoryError,
+)
 
 
 def _utcnow() -> datetime:
@@ -444,6 +453,339 @@ def _detector_monitoring_run(runs):
     )
 
 
+def test_monitoring_ingestion_persists_new_signal_evidence_idempotently(
+    session,
+    signal_graph,
+):
+    signal = _run_signal("sig-evidence-new", _utcnow())
+    monitoring_run = _detector_monitoring_run([("pattern", [signal])])
+
+    assert persist_monitoring_signals(monitoring_run, session) == 1
+    evidence_rows = list(
+        session.scalars(
+            select(PersistedEvidenceRecord).where(
+                PersistedEvidenceRecord.source == "signal"
+            )
+        )
+    )
+    assert len(evidence_rows) == 1
+    assert evidence_rows[0].source_ref == "sig-evidence-new"
+    assert evidence_rows[0].source_snapshot["signal_id"] == "sig-evidence-new"
+    assert evidence_rows[0].attributes["tool_name"] == "search"
+
+    assert persist_monitoring_signals(monitoring_run, session) == 0
+    assert EvidenceRepository(session).get(evidence_rows[0].evidence_id) is not None
+    assert session.scalar(
+        select(func.count()).select_from(PersistedEvidenceRecord)
+    ) == 1
+
+
+def test_monitoring_ingestion_uses_canonical_signal_after_semantic_dedupe(
+    session,
+    signal_graph,
+):
+    detected_at = _utcnow()
+    canonical = _run_signal("sig-evidence-canonical", detected_at)
+    replay = _run_signal(
+        "sig-evidence-attempted",
+        detected_at + timedelta(seconds=30),
+    )
+
+    assert persist_monitoring_signals(
+        _detector_monitoring_run([("pattern", [canonical])]),
+        session,
+    ) == 1
+    assert persist_monitoring_signals(
+        _detector_monitoring_run([("pattern", [replay])]),
+        session,
+    ) == 0
+
+    persisted_signals = list(session.scalars(select(PersistedSignal)))
+    evidence_rows = list(
+        session.scalars(
+            select(PersistedEvidenceRecord).where(
+                PersistedEvidenceRecord.source == "signal"
+            )
+        )
+    )
+
+    assert [row.signal_id for row in persisted_signals] == [
+        "sig-evidence-canonical"
+    ]
+    assert len(evidence_rows) == 1
+    assert evidence_rows[0].source_ref == "sig-evidence-canonical"
+    assert evidence_rows[0].source_snapshot["signal_id"] == "sig-evidence-canonical"
+    assert evidence_rows[0].attributes == persisted_signals[0].payload
+    assert evidence_rows[0].source_ref != "sig-evidence-attempted"
+
+    assert persist_monitoring_signals(
+        _detector_monitoring_run([("pattern", [replay])]),
+        session,
+    ) == 0
+    assert session.scalar(
+        select(func.count()).select_from(PersistedEvidenceRecord)
+    ) == 1
+
+
+def test_monitoring_ingestion_primary_key_conflict_uses_stored_row(
+    session,
+    signal_graph,
+):
+    attempted = _run_signal("sig-primary-conflict", _utcnow())
+    canonical = _run_signal("sig-primary-conflict", attempted.detected_at)
+    canonical.payload = RepeatedToolUsagePayload(
+        tool_name="read",
+        occurrence_count=3,
+        sequence=["read", "read", "read"],
+        severity=0.8,
+        related_event_ids=["evt-canonical-1", "evt-canonical-2"],
+    )
+    canonical_row = persisted_signal_from_record(
+        signal_to_record(canonical, detector_name="pattern")
+    )
+    assert PersistedSignalRepository(session).insert_ignore_duplicates(
+        [canonical_row]
+    ) == 1
+
+    assert persist_monitoring_signals(
+        _detector_monitoring_run([("pattern", [attempted])]),
+        session,
+    ) == 0
+
+    evidence_rows = list(
+        session.scalars(
+            select(PersistedEvidenceRecord).where(
+                PersistedEvidenceRecord.source == "signal"
+            )
+        )
+    )
+    assert len(evidence_rows) == 1
+    assert evidence_rows[0].source_ref == canonical_row.signal_id
+    assert evidence_rows[0].attributes == canonical_row.payload
+    assert evidence_rows[0].source_snapshot["dedupe_key"] == canonical_row.dedupe_key
+    assert evidence_rows[0].attributes["tool_name"] == "read"
+
+
+def test_monitoring_ingestion_composite_conflict_uses_stored_row(
+    session,
+    signal_graph,
+):
+    session.add(
+        Event(
+            event_id="evt-composite-conflict",
+            run_id="run-1",
+            sequence_number=91,
+            event_type="tool_called",
+            occurred_at=_utcnow(),
+            payload={"tool_name": "search"},
+        )
+    )
+    session.flush()
+
+    attempted = _run_signal("sig-composite-attempt", _utcnow())
+    attempted.source_event_id = "evt-composite-conflict"
+    attempted.projection_version = "projection-v1"
+    canonical = PersistedSignal(
+        signal_id="sig-composite-canonical",
+        origin="detector",
+        source_event_id="evt-composite-conflict",
+        projection_version="projection-v1",
+        agent_id="agent-1",
+        signal_type="error_pattern",
+        scope="run",
+        run_id="run-1",
+        detected_at=attempted.detected_at,
+        payload={"error_type": "canonical-error", "occurrence_count": 4},
+        payload_type="ErrorPatternPayload",
+        dedupe_key="unrelated-canonical-dedupe-key",
+    )
+    assert PersistedSignalRepository(session).insert_ignore_duplicates(
+        [canonical]
+    ) == 1
+
+    assert persist_monitoring_signals(
+        _detector_monitoring_run([("pattern", [attempted])]),
+        session,
+    ) == 0
+
+    evidence_rows = list(
+        session.scalars(
+            select(PersistedEvidenceRecord).where(
+                PersistedEvidenceRecord.source == "signal"
+            )
+        )
+    )
+    assert len(evidence_rows) == 1
+    assert evidence_rows[0].source_ref == canonical.signal_id
+    assert evidence_rows[0].attributes == canonical.payload
+    assert evidence_rows[0].source_snapshot["projection_version"] == "projection-v1"
+    assert evidence_rows[0].source_ref != attempted.signal_id
+
+
+def test_monitoring_ingestion_batch_resolves_different_canonical_rows(
+    session,
+    signal_graph,
+):
+    detected_at = _utcnow()
+    primary_attempt = _run_signal("sig-batch-primary", detected_at)
+    primary_attempt.payload = RepeatedToolUsagePayload(
+        tool_name="browse",
+        occurrence_count=2,
+        sequence=["browse", "browse"],
+        severity=0.5,
+        related_event_ids=["evt-batch-attempt-1", "evt-batch-attempt-2"],
+    )
+    primary_canonical = _run_signal("sig-batch-primary", detected_at)
+    primary_canonical.payload = RepeatedToolUsagePayload(
+        tool_name="read",
+        occurrence_count=3,
+        sequence=["read", "read", "read"],
+        severity=0.8,
+        related_event_ids=["evt-batch-primary-1", "evt-batch-primary-2"],
+    )
+    primary_row = persisted_signal_from_record(
+        signal_to_record(primary_canonical, detector_name="pattern")
+    )
+
+    semantic_canonical = _run_signal("sig-batch-semantic-canonical", detected_at)
+    semantic_attempt = _run_signal(
+        "sig-batch-semantic-attempt",
+        detected_at + timedelta(seconds=30),
+    )
+    semantic_record = signal_to_record(
+        semantic_canonical,
+        detector_name="pattern",
+    )
+    semantic_record.dedupe_key = signal_dedupe_key(semantic_record)
+    semantic_row = persisted_signal_from_record(semantic_record)
+    attempted_semantic_record = signal_to_record(
+        semantic_attempt,
+        detector_name="pattern",
+    )
+    assert signal_dedupe_key(attempted_semantic_record) == semantic_row.dedupe_key
+    signal_repository = PersistedSignalRepository(session)
+    assert signal_repository.insert_ignore_duplicates([primary_row]) == 1
+    assert signal_repository.insert_ignore_duplicates([semantic_row]) == 1
+    assert (
+        PersistedSignalRepository(session)
+        .get("sig-batch-semantic-canonical")
+        .dedupe_key
+        == semantic_row.dedupe_key
+    )
+
+    inserted_count = persist_monitoring_signals(
+        _detector_monitoring_run(
+            [("pattern", [primary_attempt, semantic_attempt])]
+        ),
+        session,
+    )
+    assert inserted_count == 0, [
+        row.signal_id for row in session.scalars(select(PersistedSignal))
+    ]
+
+    evidence_rows = list(
+        session.scalars(
+            select(PersistedEvidenceRecord)
+            .where(PersistedEvidenceRecord.source == "signal")
+            .order_by(PersistedEvidenceRecord.source_ref.asc())
+        )
+    )
+    assert [row.source_ref for row in evidence_rows] == [
+        "sig-batch-primary",
+        "sig-batch-semantic-canonical",
+    ]
+    assert {row.attributes["tool_name"] for row in evidence_rows} == {
+        "read",
+        "search",
+    }
+    assert session.scalar(
+        select(func.count()).select_from(PersistedEvidenceRecord)
+    ) == 2
+
+
+def test_monitoring_ingestion_rejects_ambiguous_unique_key_conflict(
+    session,
+    signal_graph,
+):
+    session.add(
+        Event(
+            event_id="evt-ambiguous-conflict",
+            run_id="run-1",
+            sequence_number=92,
+            event_type="tool_called",
+            occurred_at=_utcnow(),
+            payload={},
+        )
+    )
+    session.flush()
+
+    attempted = _run_signal("sig-ambiguous-primary", _utcnow())
+    attempted.source_event_id = "evt-ambiguous-conflict"
+    attempted.projection_version = "projection-v2"
+    attempted_record = signal_to_record(attempted, detector_name="pattern")
+    attempted_dedupe_key = signal_dedupe_key(attempted_record)
+
+    by_primary_key = PersistedSignal(
+        signal_id=attempted.signal_id,
+        origin="detector",
+        source_event_id=None,
+        projection_version=None,
+        agent_id="agent-1",
+        signal_type="error_pattern",
+        scope="run",
+        run_id="run-1",
+        detected_at=attempted.detected_at,
+        payload={"error_type": "primary-canonical", "occurrence_count": 2},
+        payload_type="ErrorPatternPayload",
+        dedupe_key="canonical-primary-key",
+    )
+    by_dedupe_key = PersistedSignal(
+        signal_id="sig-ambiguous-dedupe",
+        origin="detector",
+        agent_id="agent-1",
+        signal_type="error_pattern",
+        scope="run",
+        run_id="run-1",
+        detected_at=attempted.detected_at,
+        payload={"error_type": "dedupe-canonical", "occurrence_count": 3},
+        payload_type="ErrorPatternPayload",
+        dedupe_key=attempted_dedupe_key,
+    )
+    by_composite_key = PersistedSignal(
+        signal_id="sig-ambiguous-composite",
+        origin="detector",
+        source_event_id="evt-ambiguous-conflict",
+        projection_version="projection-v2",
+        agent_id="agent-1",
+        signal_type="error_pattern",
+        scope="run",
+        run_id="run-1",
+        detected_at=attempted.detected_at,
+        payload={"error_type": "composite-canonical", "occurrence_count": 4},
+        payload_type="ErrorPatternPayload",
+        dedupe_key="canonical-composite-key",
+    )
+    assert PersistedSignalRepository(session).insert_ignore_duplicates(
+        [by_primary_key, by_dedupe_key, by_composite_key]
+    ) == 3
+
+    with pytest.raises(RepositoryError, match="multiple canonical persisted rows"):
+        persist_monitoring_signals(
+            _detector_monitoring_run([("pattern", [attempted])]),
+            session,
+        )
+
+    evidence_rows = list(
+        session.scalars(
+            select(PersistedEvidenceRecord).where(
+                PersistedEvidenceRecord.source == "signal"
+            )
+        )
+    )
+    assert evidence_rows == []
+    assert session.scalar(select(func.count()).select_from(PersistedSignal)) == 3
+
+
 def test_re_emitted_logical_detection_is_not_duplicated(session, signal_graph):
     repo = PersistedSignalRepository(session)
 
@@ -470,6 +812,80 @@ def test_re_emitted_logical_detection_is_not_duplicated(session, signal_graph):
     assert rows[0].dedupe_key is not None
 
 
+def test_dedupe_identity_ignores_signal_id_and_ordinal_but_tracks_semantics():
+    now = _utcnow()
+    first = signal_to_record(
+        _run_signal("sig-semantic-a", now),
+        detector_name="pattern",
+    )
+    replay = signal_to_record(
+        _run_signal("sig-semantic-b", now + timedelta(seconds=30)),
+        detector_name="pattern",
+    )
+    distinct_signal = _run_signal("sig-semantic-c", now)
+    distinct_signal.payload = RepeatedToolUsagePayload(
+        tool_name="search",
+        occurrence_count=2,
+        sequence=["search", "search"],
+        severity=0.5,
+        related_event_ids=["evt-other-1", "evt-other-2"],
+    )
+    distinct = signal_to_record(
+        distinct_signal,
+        detector_name="pattern",
+    )
+
+    expected_key = signal_dedupe_key(first, ordinal=0)
+
+    assert expected_key == signal_dedupe_key(first, ordinal=9)
+    assert expected_key == signal_dedupe_key(replay, ordinal=1)
+    assert expected_key != signal_dedupe_key(distinct, ordinal=1)
+
+
+def test_semantic_duplicate_batch_and_replay_are_idempotent(session, signal_graph):
+    first = _run_signal("sig-batch-a", _utcnow())
+    second = _run_signal("sig-batch-b", first.detected_at)
+    monitoring_run = _detector_monitoring_run(
+        [("pattern", [first, second])]
+    )
+
+    assert persist_monitoring_signals(monitoring_run, session) == 1
+    assert session.scalar(select(func.count()).select_from(PersistedSignal)) == 1
+
+    replay = _detector_monitoring_run(
+        [
+            (
+                "pattern",
+                [
+                    _run_signal("sig-replay-a", first.detected_at + timedelta(seconds=30)),
+                    _run_signal("sig-replay-b", first.detected_at + timedelta(seconds=30)),
+                ],
+            )
+        ]
+    )
+
+    assert persist_monitoring_signals(replay, session) == 0
+    assert session.scalar(select(func.count()).select_from(PersistedSignal)) == 1
+
+
+def test_distinct_semantic_detections_both_persist(session, signal_graph):
+    first = _run_signal("sig-distinct-a", _utcnow())
+    second = _run_signal("sig-distinct-b", first.detected_at)
+    second.payload = RepeatedToolUsagePayload(
+        tool_name="search",
+        occurrence_count=2,
+        sequence=["search", "search"],
+        severity=0.5,
+        related_event_ids=["evt-distinct-1", "evt-distinct-2"],
+    )
+
+    assert persist_monitoring_signals(
+        _detector_monitoring_run([("pattern", [first, second])]),
+        session,
+    ) == 2
+    assert session.scalar(select(func.count()).select_from(PersistedSignal)) == 2
+
+
 def test_distinct_detections_survive_logical_dedupe(session, signal_graph):
     session.add(
         Run(
@@ -485,6 +901,13 @@ def test_distinct_detections_survive_logical_dedupe(session, signal_graph):
     now = _utcnow()
     duplicate_a = _run_signal("sig-ord-a", now)
     duplicate_b = _run_signal("sig-ord-b", now)
+    duplicate_b.payload = RepeatedToolUsagePayload(
+        tool_name="search",
+        occurrence_count=2,
+        sequence=["search", "search"],
+        severity=0.5,
+        related_event_ids=["evt-t3", "evt-t4"],
+    )
 
     different_tool = _run_signal("sig-tool", now)
     different_tool.payload = RepeatedToolUsagePayload(
@@ -526,7 +949,9 @@ def test_distinct_detections_survive_logical_dedupe(session, signal_graph):
                 "pattern",
                 [
                     _run_signal("sig-ord-a2", now + timedelta(seconds=30)),
-                    _run_signal("sig-ord-b2", now + timedelta(seconds=30)),
+                    _run_signal("sig-ord-b2", now + timedelta(seconds=30)).model_copy(
+                        update={"payload": duplicate_b.payload}
+                    ),
                     tool_again,
                     run_again,
                     _window_signal("sig-window-a2", now),

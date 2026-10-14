@@ -1,6 +1,7 @@
 
 from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager
+from hashlib import sha256
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -33,9 +34,15 @@ from ai_eval_platform.monitoring.persistence import (
     signal_to_record,
 )
 from ai_eval_platform.monitoring.signals.models import Signal
-from ai_eval_platform.storage.models import Event, PersistedSignal, Run
+from ai_eval_platform.storage.models import (
+    Event,
+    PersistedEvidenceRecord,
+    PersistedSignal,
+    Run,
+)
 from ai_eval_platform.storage.repositories import (
     EventRepository,
+    EvidenceRepository,
     PersistedSignalRepository,
     RunRepository,
 )
@@ -363,6 +370,157 @@ def persisted_signal_from_record(
     )
 
 
+def _signal_evidence_kind(signal_type: str) -> str:
+    mapping: dict[str, str] = {
+        "event_observation": "observation",
+        "latency_anomaly": "quantitative",
+        "confidence_drop": "quantitative",
+        "route_change": "pattern",
+        "repeated_tool_usage": "pattern",
+        "tool_usage_drift": "pattern",
+        "error_pattern": "error",
+    }
+    try:
+        return mapping[signal_type]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported signal type for evidence: '{signal_type}'."
+        ) from exc
+
+
+def _evidence_id(source: str, source_ref: str) -> str:
+    return sha256(f"{source}:{source_ref}".encode("utf-8")).hexdigest()
+
+
+def signal_to_evidence_record(
+    signal: PersistedSignal,
+    *,
+    domain: str = "monitoring",
+) -> PersistedEvidenceRecord:
+    agent_id = str(signal.agent_id or "").strip()
+    if not agent_id:
+        raise ValueError("Signal evidence requires a non-empty agent_id.")
+
+    subject_id = agent_id
+    source_snapshot = {
+        "signal_id": signal.signal_id,
+        "agent_id": signal.agent_id,
+        "source_event_id": signal.source_event_id,
+        "source_observation_id": signal.source_observation_id,
+        "projection_version": signal.projection_version,
+        "signal_type": signal.signal_type,
+        "scope": signal.scope,
+        "run_id": signal.run_id,
+        "evaluation_run_id": signal.evaluation_run_id,
+        "window_start": signal.window_start.isoformat() if signal.window_start is not None else None,
+        "window_end": signal.window_end.isoformat() if signal.window_end is not None else None,
+        "detector_name": signal.detector_name,
+        "dedupe_key": signal.dedupe_key,
+    }
+
+    return PersistedEvidenceRecord(
+        evidence_id=_evidence_id("signal", signal.signal_id),
+        source="signal",
+        source_ref=signal.signal_id,
+        evidence_kind=_signal_evidence_kind(signal.signal_type),
+        domain=domain,
+        subject_type="agent",
+        subject_id=subject_id,
+        agent_id=agent_id,
+        system_id=None,
+        system_version=None,
+        run_id=signal.run_id,
+        evaluation_run_id=signal.evaluation_run_id,
+        trace_id=None,
+        span_id=None,
+        parent_span_id=None,
+        component_id=None,
+        observed_at=signal.detected_at,
+        attributes=dict(signal.payload or {}),
+        limitations=[
+            "Signal evidence is descriptive only; it does not establish causation or statistical significance.",
+        ],
+        source_snapshot=source_snapshot,
+    )
+
+
+def event_to_evidence_record(
+    event: Event,
+    *,
+    session: Session | None = None,
+    domain: str = "monitoring",
+) -> PersistedEvidenceRecord:
+    agent_id: str | None = None
+    if session is not None:
+        run = session.get(Run, event.run_id)
+        if run is not None:
+            agent_id = run.agent_id
+
+    if not agent_id:
+        raise ValueError(
+            f"Event '{event.event_id}' cannot become evidence without a run-bound agent_id."
+        )
+
+    return PersistedEvidenceRecord(
+        evidence_id=_evidence_id("event", event.event_id),
+        source="event",
+        source_ref=event.event_id,
+        evidence_kind="observation",
+        domain=domain,
+        subject_type="agent",
+        subject_id=agent_id,
+        agent_id=agent_id,
+        system_id=event.system_id,
+        system_version=event.system_version,
+        run_id=event.run_id,
+        evaluation_run_id=None,
+        trace_id=None,
+        span_id=None,
+        parent_span_id=None,
+        component_id=None,
+        observed_at=event.occurred_at,
+        attributes=dict(event.payload or {}),
+        limitations=[
+            "Event evidence is descriptive only; it does not establish causation or statistical significance.",
+        ],
+        source_snapshot={
+            "event_id": event.event_id,
+            "run_id": event.run_id,
+            "sequence_number": event.sequence_number,
+            "event_type": event.event_type,
+            "parent_event_id": event.parent_event_id,
+            "correlation_id": event.correlation_id,
+            "causation_id": event.causation_id,
+            "step_id": event.step_id,
+            "system_id": event.system_id,
+            "system_version": event.system_version,
+        },
+    )
+
+
+def persist_signal_evidence(
+    session: Session,
+    signals: Sequence[PersistedSignal],
+    *,
+    domain: str = "monitoring",
+) -> int:
+    rows = [signal_to_evidence_record(signal, domain=domain) for signal in signals]
+    return EvidenceRepository(session).insert_ignore_duplicates(rows)
+
+
+def persist_event_evidence(
+    session: Session,
+    events: Sequence[Event],
+    *,
+    domain: str = "monitoring",
+) -> int:
+    rows = [
+        event_to_evidence_record(event, session=session, domain=domain)
+        for event in events
+    ]
+    return EvidenceRepository(session).insert_ignore_duplicates(rows)
+
+
 def persist_monitoring_signals(
     monitoring_run: MonitoringRun,
     session: Session,
@@ -392,9 +550,12 @@ def persist_monitoring_signals(
                 persisted_signal_from_record(record)
             )
 
-    return PersistedSignalRepository(
-        session
-    ).insert_ignore_duplicates(rows)
+    signal_repository = PersistedSignalRepository(session)
+    with session.begin_nested():
+        inserted = signal_repository.insert_ignore_duplicates(rows)
+        canonical_rows = signal_repository.resolve_canonical_rows(rows)
+        persist_signal_evidence(session, canonical_rows)
+    return inserted
 
 
 def monitor_completed_run(
@@ -442,11 +603,15 @@ __all__ = [
     "RunMonitoringContext",
     "RunMonitoringResult",
     "RunNotCompletedError",
+    "event_to_evidence_record",
     "build_run_records",
     "load_run_monitoring_context",
     "monitor_completed_run",
+    "persist_event_evidence",
+    "persist_signal_evidence",
     "persist_monitoring_signals",
     "persisted_signal_from_record",
+    "signal_to_evidence_record",
     "run_record_from_run",
     "select_run_assignments",
 ]

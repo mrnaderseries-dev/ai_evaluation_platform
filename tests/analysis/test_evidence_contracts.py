@@ -54,6 +54,25 @@ class TestEvidenceRecord:
         with pytest.raises(ValidationError, match="span_id requires trace_id"):
             _record(span_id="s-1")
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("trace_id", ""),
+            ("trace_id", "  "),
+            ("span_id", ""),
+            ("span_id", "  "),
+            ("parent_span_id", ""),
+            ("parent_span_id", "  "),
+        ],
+    )
+    def test_blank_trace_identifiers_rejected(self, field, value):
+        with pytest.raises(ValidationError, match="must not be blank"):
+            _record(**{field: value})
+
+    def test_self_parent_rejected(self):
+        with pytest.raises(ValidationError, match="cannot be its own parent"):
+            _record(trace_id="t-1", span_id="s-1", parent_span_id="s-1")
+
     def test_optional_fields_default_to_none(self):
         record = _record()
         assert record.system_id is None
@@ -103,7 +122,10 @@ class TestEvidenceRelationship:
             basis="temporal",
             agent_id="a1",
             evidence_ids=evidence_ids,
-            observed_at=("2026-01-01T00:00:00+00:00",),
+            observed_at=tuple(
+                "2026-01-01T00:00:00+00:00"
+                for _ in evidence_ids
+            ),
         )
         base.update(kw)
         return AnalyzerEvidenceRelationship(**base)

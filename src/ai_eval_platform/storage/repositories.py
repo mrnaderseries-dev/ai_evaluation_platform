@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, TypeVar
 
-from sqlalchemy import func, inspect, or_, select, update
+from sqlalchemy import and_, func, inspect, or_, select, update
 from sqlalchemy.orm import Session
 
 from .models import (
@@ -40,6 +40,9 @@ from .models import (
     Run,
     TrainingRun,
     utc_now,
+    PersistedEvidenceRecord,
+    PersistedRelationship,
+    RelationshipEvidence,
 )
 
 
@@ -453,6 +456,7 @@ class EventRepository:
         self.session.add(event)
         self.session.flush()
         self._project_event_by_id(event.event_id)
+        self._persist_event_evidence([event.event_id])
         return event
 
     def create_many(self, events: list[Event]) -> list[Event]:
@@ -460,6 +464,7 @@ class EventRepository:
         self.session.flush()
         for event in events:
             self._project_event_by_id(event.event_id)
+        self._persist_event_evidence([event.event_id for event in events])
         return events
 
     def insert_ignore_duplicates(self, events: list[Event]) -> int:
@@ -499,6 +504,7 @@ class EventRepository:
         # detector execution. Canonical stored rows are used on redelivery.
         for event in events:
             self._project_event_by_id(event.event_id)
+        self._persist_event_evidence([event.event_id for event in events])
 
         rowcount = result.rowcount
 
@@ -613,6 +619,22 @@ class EventRepository:
         )
         self.session.execute(statement)
         self.session.flush()
+
+        from ..monitoring_integration import persist_signal_evidence
+
+        persist_signal_evidence(self.session, [row])
+
+    def _persist_event_evidence(self, event_ids: list[str]) -> None:
+        from ..monitoring_integration import persist_event_evidence
+
+        canonical_events = [
+            self.get(event_id)
+            for event_id in event_ids
+        ]
+        persist_event_evidence(
+            self.session,
+            [event for event in canonical_events if event is not None],
+        )
 
     def get(self, event_id: str) -> Event | None:
         return self.session.get(Event, event_id)
@@ -780,6 +802,7 @@ class EventRepository:
             .values(detail_row)
             .on_conflict_do_nothing(index_elements=["event_id"])
         )
+
         detail_result = self.session.execute(detail_statement)
         detail_rowcount = detail_result.rowcount
         detail_inserted = (
@@ -850,6 +873,58 @@ class PersistedSignalRepository:
 
     def get(self, signal_id: str) -> PersistedSignal | None:
         return self.session.get(PersistedSignal, signal_id)
+
+    def resolve_canonical_rows(
+        self,
+        attempted_rows: list[PersistedSignal],
+    ) -> list[PersistedSignal]:
+        """Resolve each attempted row to exactly one canonical stored row."""
+        if not attempted_rows:
+            return []
+
+        canonical_by_id: dict[str, PersistedSignal] = {}
+        for attempted in attempted_rows:
+            identities = [PersistedSignal.signal_id == attempted.signal_id]
+            if attempted.dedupe_key is not None:
+                identities.append(
+                    PersistedSignal.dedupe_key == attempted.dedupe_key
+                )
+            if (
+                attempted.source_event_id is not None
+                and attempted.origin is not None
+                and attempted.projection_version is not None
+            ):
+                identities.append(
+                    and_(
+                        PersistedSignal.source_event_id
+                        == attempted.source_event_id,
+                        PersistedSignal.origin == attempted.origin,
+                        PersistedSignal.projection_version
+                        == attempted.projection_version,
+                    )
+                )
+
+            matches = list(
+                self.session.scalars(
+                    select(PersistedSignal).where(or_(*identities))
+                )
+            )
+            matches_by_id = {row.signal_id: row for row in matches}
+            if len(matches_by_id) != 1:
+                reason = (
+                    "no canonical persisted row"
+                    if not matches_by_id
+                    else "multiple canonical persisted rows"
+                )
+                raise RepositoryError(
+                    f"Signal '{attempted.signal_id}' resolved to {reason} "
+                    "across its unique identities."
+                )
+
+            canonical_id, canonical_row = next(iter(matches_by_id.items()))
+            canonical_by_id[canonical_id] = canonical_row
+
+        return [canonical_by_id[key] for key in sorted(canonical_by_id)]
 
     def list_for_run(
         self,
@@ -946,8 +1021,295 @@ class PersistedSignalRepository:
         )
 
         return list(self.session.scalars(statement))
+# ============================================================================
+# Evidence and Relationship Persistence
+# ============================================================================
 
 
+class EvidenceRepository:
+    """Persistence for reusable, agent-agnostic evidence."""
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def insert_ignore_duplicates(
+        self,
+        records: list[PersistedEvidenceRecord],
+    ) -> int:
+        if not records:
+            return 0
+
+        inserted = 0
+        for record in records:
+            statement = (
+                _dialect_insert(self.session)(PersistedEvidenceRecord)
+                .values(_snapshot_row(record))
+                .on_conflict_do_nothing()
+            )
+            result = self.session.execute(statement)
+            if result.rowcount is not None and result.rowcount > 0:
+                inserted += int(result.rowcount)
+
+        self.session.flush()
+        return inserted
+
+    def get(self, evidence_id: str) -> PersistedEvidenceRecord | None:
+        return self.session.get(PersistedEvidenceRecord, evidence_id)
+
+    def list_for_subject(
+        self,
+        subject_type: str,
+        subject_id: str,
+        *,
+        domain: str | None = None,
+        observed_after: datetime | None = None,
+        observed_before: datetime | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[PersistedEvidenceRecord]:
+        if limit < 1 or offset < 0:
+            raise ValueError("limit must be positive and offset non-negative")
+
+        statement = select(PersistedEvidenceRecord).where(
+            PersistedEvidenceRecord.subject_type == subject_type,
+            PersistedEvidenceRecord.subject_id == subject_id,
+        )
+
+        if domain is not None:
+            statement = statement.where(
+                PersistedEvidenceRecord.domain == domain
+            )
+
+        if observed_after is not None:
+            statement = statement.where(
+                PersistedEvidenceRecord.observed_at >= observed_after
+            )
+
+        if observed_before is not None:
+            statement = statement.where(
+                PersistedEvidenceRecord.observed_at <= observed_before
+            )
+
+        statement = (
+            statement
+            .order_by(
+                PersistedEvidenceRecord.observed_at.asc(),
+                PersistedEvidenceRecord.evidence_id.asc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+
+        return list(self.session.scalars(statement))
+
+
+class RelationshipRepository:
+    """Persistence and retrieval for analytical relationships."""
+
+    VALID_STATUSES = {"candidate", "validated", "rejected"}
+    VALID_EVIDENCE_ROLES = {"supporting", "counter", "context"}
+
+    def __init__(self, session: Session):
+        self.session = session
+
+    def get(self, relationship_id: str) -> PersistedRelationship | None:
+        return self.session.get(PersistedRelationship, relationship_id)
+
+    def get_by_analysis_key(
+        self,
+        analysis_id: str,
+        relationship_key: str,
+    ) -> PersistedRelationship | None:
+        statement = select(PersistedRelationship).where(
+            PersistedRelationship.analysis_id == analysis_id,
+            PersistedRelationship.relationship_key == relationship_key,
+        )
+        return self.session.scalar(statement)
+
+    def insert_with_evidence_ignore_duplicates(
+        self,
+        relationship: PersistedRelationship,
+        evidence_links: list[RelationshipEvidence],
+    ) -> tuple[PersistedRelationship, bool]:
+        """
+        Persist a relationship and its evidence links in the caller's
+        transaction.
+
+        Returns (persisted_relationship, inserted).
+        A replay reuses the existing relationship and inserts any missing
+        evidence links. This method flushes but never commits.
+        """
+        if relationship.status != "candidate":
+            raise RepositoryError(
+                "New relationships must be inserted as candidates; "
+                "use set_validation_status() for reviewed status changes."
+            )
+
+        for link in evidence_links:
+            if link.role not in self.VALID_EVIDENCE_ROLES:
+                raise ValueError(
+                    f"Unsupported evidence role: {link.role}"
+                )
+
+            if (
+                link.relationship_id
+                and link.relationship_id != relationship.relationship_id
+            ):
+                raise ValueError(
+                    "Evidence link references a different relationship"
+                )
+
+        values = _snapshot_row(relationship)
+
+        statement = (
+            _dialect_insert(self.session)(PersistedRelationship)
+            .values(values)
+            .on_conflict_do_nothing()
+        )
+
+        result = self.session.execute(statement)
+        self.session.flush()
+
+        rowcount = result.rowcount
+        inserted = rowcount == 1
+
+        # A conflict may mean the same analysis/key was already persisted
+        # with a different generated relationship_id.
+        persisted = self.get_by_analysis_key(
+            relationship.analysis_id,
+            relationship.relationship_key,
+        )
+
+        if persisted is None:
+            raise RepositoryError(
+                "Relationship insert did not produce a retrievable row"
+            )
+
+        if not inserted and persisted.status in {"validated", "rejected"}:
+            same_relationship = (
+                persisted.relationship_type == relationship.relationship_type
+                and persisted.basis == relationship.basis
+                and persisted.algorithm_name == relationship.algorithm_name
+                and persisted.algorithm_version == relationship.algorithm_version
+                and dict(persisted.scope or {}) == dict(relationship.scope or {})
+                and dict(persisted.attributes or {})
+                == dict(relationship.attributes or {})
+                and list(persisted.limitations or [])
+                == list(relationship.limitations or [])
+            )
+            existing_links = {
+                (link.evidence_id, link.role, link.evidence_order)
+                for link in self.list_evidence_links(persisted.relationship_id)
+            }
+            replayed_links = {
+                (link.evidence_id, link.role, link.evidence_order)
+                for link in evidence_links
+            }
+
+            if not same_relationship or replayed_links != existing_links:
+                raise RepositoryError(
+                    "Cannot change a validated or rejected relationship "
+                    "or its evidence links during replay."
+                )
+
+        for link in evidence_links:
+            link_values = _snapshot_row(link)
+            link_values["relationship_id"] = persisted.relationship_id
+
+            link_statement = (
+                _dialect_insert(self.session)(RelationshipEvidence)
+                .values(link_values)
+                .on_conflict_do_nothing()
+            )
+            self.session.execute(link_statement)
+
+        self.session.flush()
+        return persisted, inserted
+
+    def list_for_analysis(
+        self,
+        analysis_id: str,
+        *,
+        status: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[PersistedRelationship]:
+        if limit < 1 or offset < 0:
+            raise ValueError("limit must be positive and offset non-negative")
+
+        statement = select(PersistedRelationship).where(
+            PersistedRelationship.analysis_id == analysis_id
+        )
+
+        if status is not None:
+            if status not in self.VALID_STATUSES:
+                raise ValueError(f"Unsupported relationship status: {status}")
+
+            statement = statement.where(
+                PersistedRelationship.status == status
+            )
+
+        statement = (
+            statement
+            .order_by(
+                PersistedRelationship.discovered_at.desc(),
+                PersistedRelationship.relationship_id.asc(),
+            )
+            .limit(limit)
+            .offset(offset)
+        )
+
+        return list(self.session.scalars(statement))
+
+    def list_evidence_links(
+        self,
+        relationship_id: str,
+    ) -> list[RelationshipEvidence]:
+        statement = (
+            select(RelationshipEvidence)
+            .where(
+                RelationshipEvidence.relationship_id == relationship_id
+            )
+            .order_by(
+                RelationshipEvidence.evidence_order.asc(),
+                RelationshipEvidence.relationship_evidence_id.asc(),
+            )
+        )
+        return list(self.session.scalars(statement))
+
+    def set_validation_status(
+        self,
+        relationship_id: str,
+        *,
+        status: str,
+        validated_by: str,
+        notes: str | None = None,
+    ) -> PersistedRelationship:
+        """
+        Explicit human/application validation action.
+        Detection itself must never call this method implicitly.
+        """
+        if status not in {"validated", "rejected"}:
+            raise ValueError(
+                "Validation status must be 'validated' or 'rejected'"
+            )
+
+        if not validated_by.strip():
+            raise ValueError("validated_by must not be empty")
+
+        relationship = self.get(relationship_id)
+        if relationship is None:
+            raise EntityNotFoundError(
+                f"Relationship '{relationship_id}' does not exist"
+            )
+
+        relationship.status = status
+        relationship.validated_at = utc_now()
+        relationship.validated_by = validated_by
+        relationship.validation_notes = notes
+
+        self.session.flush()
+        return relationship
 # ============================================================================
 # Dataset
 # ============================================================================

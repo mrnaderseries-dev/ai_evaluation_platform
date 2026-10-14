@@ -73,7 +73,11 @@ def signal_dedupe_key(
     """Build a deterministic key from the signal's semantic content.
 
     The ordinal parameter remains for source compatibility but is deliberately
-    excluded: list position is not stable identity across replays.
+    excluded: list position is not stable identity across replays. Identity is
+    defined by agent, detector, evaluation/run scope, payload and payload type,
+    origin, source event/observation and projection version, signal type, and
+    window bounds. Signal ID and detected/recorded timestamps are excluded so
+    replayed representations of the same detection share a key.
     """
     identity = {
         "agent_id": record.agent_id,
