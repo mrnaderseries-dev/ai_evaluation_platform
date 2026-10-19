@@ -14,3 +14,11 @@ src/ai_eval_platform.egg-info/
 out.txt
 pytest_out.txt
 storage_dump.txt
+
+# Local-only scratch: editor settings, backups, probes, generated test outputs
+.vscode/
+.rca*_backup_*/
+*_probe*.py
+*_probe*.txt
+*_pytest_*.txt
+baseline_pytest.txt
