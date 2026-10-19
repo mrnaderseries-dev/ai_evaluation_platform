@@ -27,9 +27,10 @@ dependencies = [
 
 [project.optional-dependencies]
 # Required to run the test suite. Keep this list in sync with what the tests
-# actually import (currently: pytest only).
+# actually import (currently: pytest and httpx2 for FastAPI/Starlette TestClient).
 dev = [
     "pytest>=8.0",
+    "httpx2>=2.0.0",
 ]
 # Kafka transport. Optional because the application layer
 # (src/ai_eval_platform/ingestion) depends only on the ConfirmedProducer /
