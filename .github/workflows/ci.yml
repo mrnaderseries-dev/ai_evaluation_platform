@@ -1,0 +1,41 @@
+# First CI baseline for the AI Evaluation Platform.
+#
+# Scope: run the unit/contract/storage test tiers on every push to, and every
+# pull request against, the upload-project baseline branch.
+# PostgreSQL and real-Kafka integration tests self-skip when DATABASE_URL is
+# unset and confluent-kafka is absent, so the expected result on a fresh
+# runner is: 828 passed, 21 skipped. A failure here is a real regression.
+# No deployment, no secret, and no external service is used in this workflow.
+
+name: CI
+
+on:
+  push:
+    branches: [upload-project]
+  pull_request:
+    branches: [upload-project]
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Unit and contract tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install project with test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run test suite
+        run: python -m pytest -q --tb=short -rs
