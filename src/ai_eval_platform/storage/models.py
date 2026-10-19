@@ -772,11 +772,30 @@ class DriftAnalysis(Base):
     detected: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
-class RootCauseAnalysis(Base):
+class RootCauseAnalysis(Base, TimestampMixin):
     __tablename__ = "root_cause_analyses"
+    __table_args__ = (
+        Index(
+            "uq_root_cause_analyses_investigation",
+            "investigation_id",
+            unique=True,
+        ),
+        Index("ix_root_cause_analyses_fingerprint", "evidence_fingerprint"),
+    )
 
     root_cause_analysis_id: Mapped[str] = mapped_column(String(64), primary_key=True, default=new_id)
     analysis_id: Mapped[str] = mapped_column(ForeignKey("analyses.analysis_id", ondelete="CASCADE"), nullable=False, unique=True)
+    investigation_id: Mapped[str | None] = mapped_column(String(64))
+    trigger_type: Mapped[str | None] = mapped_column(String(32))
+    status: Mapped[str | None] = mapped_column(String(32))
+    conclusion_type: Mapped[str | None] = mapped_column(String(64))
+    conclusion_level: Mapped[str | None] = mapped_column(String(64))
+    schema_version: Mapped[str | None] = mapped_column(String(8))
+    algorithm_name: Mapped[str | None] = mapped_column(String(255))
+    algorithm_version: Mapped[str | None] = mapped_column(String(100))
+    evidence_fingerprint: Mapped[str | None] = mapped_column(String(128))
+    summary: Mapped[str | None] = mapped_column(Text)
+    report: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
     suspected_causes: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     evidence_event_ids: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     affected_slices: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)

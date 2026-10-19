@@ -46,3 +46,21 @@ class SignalResponse(BaseModel):
     payload: dict[str, Any]
     payload_type: str
     detector_name: str | None
+
+
+class RCAReportResponse(BaseModel):
+    investigation_id: str
+    trigger_type: str
+    status: str
+    conclusion_level: str
+    conclusion_type: str
+    schema_version: str
+    algorithm_name: str
+    algorithm_version: str
+    evidence_fingerprint: str
+    hypotheses: list[dict[str, Any]]
+    scope: dict[str, Any]
+    limitations: list[str]
+    analysis_id: str
+    created_at: datetime
+    updated_at: datetime

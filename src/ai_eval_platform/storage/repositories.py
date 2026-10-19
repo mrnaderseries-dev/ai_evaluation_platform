@@ -2029,6 +2029,13 @@ class RootCauseAnalysisRepository:
 
         return self.session.scalar(statement)
 
+    def get_by_investigation(self, investigation_id: str) -> RootCauseAnalysis | None:
+        statement = select(RootCauseAnalysis).where(
+            RootCauseAnalysis.investigation_id == investigation_id
+        )
+
+        return self.session.scalar(statement)
+
 
 
 class ArtifactRepository:
