@@ -75,6 +75,7 @@ class DatasetMatcher:
         datasets: Iterable[DatasetDescriptor],
         *,
         agent_type: str | None = None,
+        allowed_dataset_version_ids: Sequence[str] = (),
     ) -> tuple[tuple[DatasetMatch, ...], tuple[CoverageGap, ...]]:
         """Match requirements to datasets and report coverage gaps.
 
@@ -83,12 +84,18 @@ class DatasetMatcher:
             datasets: candidate dataset versions with declared coverage.
             agent_type: when given, datasets that declare a different set
                 of supported agent types are excluded.
+            allowed_dataset_version_ids: when non-empty, only datasets whose
+                ``dataset_version_id`` is in this set may be selected. This
+                is the routing-level candidate restriction: planning remains
+                the sole final selector, but it may only choose within the
+                set that routing permits. An empty set means no restriction.
 
         Returns:
             A ``(matches, gaps)`` pair. A requirement appears in at most one
             of the two.
         """
-        candidates = self._eligible(datasets, agent_type)
+        allowed = tuple(allowed_dataset_version_ids or ())
+        candidates = self._eligible(datasets, agent_type, allowed)
         matches: list[DatasetMatch] = []
         gaps: list[CoverageGap] = []
 
@@ -144,8 +151,10 @@ class DatasetMatcher:
         self,
         datasets: Iterable[DatasetDescriptor],
         agent_type: str | None,
+        allowed_dataset_version_ids: Sequence[str] = (),
     ) -> list[DatasetDescriptor]:
         """Filter out datasets that may never be selected."""
+        allowed = set(allowed_dataset_version_ids or ())
         eligible: list[DatasetDescriptor] = []
 
         for dataset in datasets:
@@ -160,6 +169,9 @@ class DatasetMatcher:
                 and dataset.agent_types_supported is not None
                 and agent_type not in dataset.agent_types_supported
             ):
+                continue
+
+            if allowed and dataset.dataset_version_id not in allowed:
                 continue
 
             eligible.append(dataset)

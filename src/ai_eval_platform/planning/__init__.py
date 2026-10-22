@@ -13,6 +13,9 @@ planning design:
   coverage matching with explicit gaps.
 * :mod:`ai_eval_platform.planning.planner` — combines changes, strategies,
   evidence, and dataset matches into an explainable plan.
+* :mod:`ai_eval_platform.planning.integration` — adapter layer that connects
+  routing to planning, fetches prior evaluation evidence from storage, and
+  orchestrates an end-to-end planning workflow.
 
 Planning never executes evaluations and never approves a deployment.
 """
@@ -54,6 +57,11 @@ from .planner import (
     explain_plan,
     validate_plan,
 )
+from .integration import (
+    EvaluationPlanningOrchestrator,
+    PriorEvidenceProvider,
+    RoutingToPlanningAdapter,
+)
 from .strategies import (
     AgenticRAGStrategy,
     AgentTypeStrategy,
@@ -84,6 +92,7 @@ __all__ = [
     "DuplicateAgentTypeError",
     "EvaluationPlan",
     "EvaluationPlanner",
+    "EvaluationPlanningOrchestrator",
     "EvaluationRequirement",
     "INELIGIBLE_QUALITY_STATUSES",
     "InvalidStrategyError",
@@ -91,9 +100,11 @@ __all__ = [
     "PlanStatus",
     "PlanValidationError",
     "PlanningError",
+    "PriorEvidenceProvider",
     "ReasonKind",
     "RiskEvidence",
     "RiskLevel",
+    "RoutingToPlanningAdapter",
     "StrategyRegistry",
     "UnsupportedAgentTypeError",
     "explain_plan",

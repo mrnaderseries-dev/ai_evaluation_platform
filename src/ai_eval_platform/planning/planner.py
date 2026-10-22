@@ -120,6 +120,7 @@ class PlanRequest:
     datasets: Sequence[DatasetDescriptor] = ()
     evidence: Sequence[RiskEvidence] = ()
     advisory_suggestions: Sequence[str] = ()
+    allowed_dataset_version_ids: Sequence[str] = ()
     policy_version: str = DEFAULT_POLICY_VERSION
 
     def __post_init__(self) -> None:
@@ -127,6 +128,9 @@ class PlanRequest:
         object.__setattr__(self, "evidence", tuple(self.evidence))
         object.__setattr__(
             self, "advisory_suggestions", tuple(self.advisory_suggestions)
+        )
+        object.__setattr__(
+            self, "allowed_dataset_version_ids", tuple(self.allowed_dataset_version_ids)
         )
 
         if self.changes.agent_id != self.agent.agent_id:
@@ -456,6 +460,7 @@ class EvaluationPlanner:
             requirements,
             request.datasets,
             agent_type=request.agent.agent_type,
+            allowed_dataset_version_ids=request.allowed_dataset_version_ids,
         )
 
         plan = self._build_plan(
@@ -535,6 +540,9 @@ class EvaluationPlanner:
         )
 
         metadata: dict[str, Any] = {
+            "allowed_dataset_version_ids": list(
+                request.allowed_dataset_version_ids
+            ),
             "change_id": request.changes.change_id,
             "change_completeness": request.changes.completeness,
             "change_count": len(request.changes.changes),
